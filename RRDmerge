@@ -1,0 +1,315 @@
+#!/usr/bin/php
+<?php
+/**
+ * RRDMerge
+ * RRDMerge is a tool to merge multiple files into a single RRD by adding the values.
+ *
+ * Require: PHP 5.3 and php5-rrd module
+ *
+ * Guillaume Marsay - OPENevents <guillaume.marsay@openevents.fr>
+ */
+ 
+$_time_start = microtime(true);
+
+error_reporting(E_ALL-E_NOTICE);
+
+
+/**********************************************************/
+// Functions
+function RRDMerge_help()
+{
+  echo "\033[1;37m- RRDMerge -\033[0m\n\n";
+  echo "Usage :\n";
+  echo "\tRRDMerge --start=<timestamp> --end=<timestamp> --source=</path/to/file1.rrd,/path/to/file2.rrd...> --output=</path/to/file_merged.rrd> [OPTIONS]\n";
+  echo "\n";
+  echo "Options :\n";
+  echo "\t\033[1m--source\033[0m\tPath to RRD files\n";
+  echo "\t\033[1m--output\033[0m\tPath to RRD file merged\n";
+  echo "\t\033[1m--start\033[0m\t\tStart time\n";
+  echo "\t\033[1m--end\033[0m\t\tEnd time\n";
+  echo "\t\033[1m--verbose\033[0m\tVerbose\n";
+  echo "\t\033[1m-h, --help\033[0m\tShow help for RRDMerge\n";
+  echo "\n\n";
+  echo "RRDMerge is developed and maintained by OPENevents. You can contact us at support@openevents.fr.\n";
+  echo "\n";
+  exit;
+}
+
+function exception_handler($exception)
+{
+  echo "\n".get_class($exception).': '.$exception->getMessage()."\n";
+  echo "This script will be stopped.\n\n";
+  exit(2);
+}
+
+
+set_exception_handler('exception_handler');
+
+
+/**********************************************************/
+// Reading parameters
+$_cmd_short_opts = array(
+  'h',
+);
+
+$_cmd_long_opts = array(
+  'source:',
+  'output:',
+  'start:',
+  'end:',
+  'help',
+  'verbose',
+);
+
+$_cmd_short_opts = implode('', $_cmd_short_opts);
+$cmd_options = getopt($_cmd_short_opts, $_cmd_long_opts);
+
+$opts = array(
+  'source' => '',
+  'output' => '',
+  'start'  => '',
+  'end'    => '',
+);
+
+if (array_key_exists('h', $cmd_options) || array_key_exists('help', $cmd_options))
+{
+  RRDMerge_help();
+}
+
+
+if (array_key_exists('verbose', $cmd_options))
+{
+  $verbose = true;
+}
+else
+{
+  $verbose = false;
+}
+
+
+if (array_key_exists('start', $cmd_options))
+{
+  $opts['start'] = $cmd_options['start'];
+}
+else
+{
+  throw new InvalidArgumentException('no start time. Use "--start=<timestamp>".');
+}
+
+
+if (array_key_exists('end', $cmd_options))
+{
+  $opts['end'] = $cmd_options['end'];
+}
+else
+{
+  throw new InvalidArgumentException('no end time. Use "--end=<timestamp>".');
+}
+
+
+if (array_key_exists('source', $cmd_options))
+{
+  $opts['source'] = $cmd_options['source'];
+  $opts['source'] = explode(',', $opts['source']);
+}
+else
+{
+  throw new InvalidArgumentException('no source files. Use "--source=/path/to/file1.rrd,/path/to/file2.rrd,...".');
+}
+
+
+if (array_key_exists('output', $cmd_options))
+{
+  $opts['output'] = $cmd_options['output'];
+  $opts['output_path'] = dirname($opts['output']);
+}
+else
+{
+  throw new InvalidArgumentException('no output file. Use "--output=/path/to/file.rrd".');
+}
+
+
+/**********************************************************/
+// Export RRD source files
+if ($verbose)
+{
+  echo "Export RRD source files... ";
+}
+
+$_xport_opts = array(
+  '--start', $opts['start'],
+  '--end', $opts['end'],
+);
+$_xport_def       = array();
+$_xport_cdef      = array();
+$_xport_input     = array();
+$_xport_output    = array();
+$_xport_cdef_in   = array();
+$_xport_cdef_out  = array();
+
+foreach ($opts['source'] as $key=>$file)
+{
+  if (!file_exists($file))
+  {
+    unset($opts['source'][$key]);
+    continue;
+    #throw new ErrorException('File '.$file.' does not exists.');
+  }
+
+  $_interface_name = explode('.', basename($file));
+  $_interface_name = $_interface_name[0];
+
+  $_xport_def[] = 'DEF:input_'.$_interface_name.'='.$file.':input:AVERAGE';
+  $_xport_def[] = 'DEF:output_'.$_interface_name.'='.$file.':output:AVERAGE';
+
+  $_xport_cdef_in[]  = 'input_' .$_interface_name;
+  $_xport_cdef_out[] = 'output_'.$_interface_name;
+}
+
+$_xport_cdef[] = 'CDEF:input='.implode(',', $_xport_cdef_in).str_repeat(',ADDNAN', (count($opts['source'])-1));
+$_xport_cdef[] = 'CDEF:output='.implode(',', $_xport_cdef_out).str_repeat(',ADDNAN', (count($opts['source'])-1));
+
+$_xport_input[] = 'XPORT:input:input';
+$_xport_output[] = 'XPORT:output:output';
+
+$_xport = array_merge($_xport_opts, $_xport_def, $_xport_cdef, $_xport_input, $_xport_output);
+
+
+$data_xport = rrd_xport($_xport);
+
+if (!$data_xport)
+{
+  throw new RuntimeException('rrd_xport() failed. '.rrd_error());
+}
+
+if ($verbose)
+{
+  echo "Ok\n";
+  // Debug
+  //echo "\n----------\n\033[1mRRDTool xport arguments :\033[0m\n".implode(' ', $_xport)."\n----------\n";
+}
+
+
+
+/**********************************************************/
+// Calculating new values to be inserted
+if ($verbose)
+{
+  echo "Calculating new values to be inserted...";
+}
+
+$new_data_merge = array();
+
+foreach ($data_xport['data'] as $data)
+{
+  if (substr($data['legend'], 0, 5) == 'input')
+  {
+    $type = 'input';
+  }
+  elseif (substr($data['legend'], 0, 6) == 'output')
+  {
+    $type = 'output';
+  }
+  else
+  {
+    throw new RuntimeException('invalid data.');
+  }
+
+  foreach ($data['data'] as $k=>$v)
+  {
+    if ($verbose)
+    {
+      echo ".";
+    }
+
+    if (!array_key_exists($k, $new_data_merge))
+    {
+      $new_data_merge[$k] = array('input' => 0, 'output' => 0);
+    }
+    
+    if (is_nan($v))
+    {
+      $v = 0;
+    }
+
+    $new_data_merge[$k][$type]+= (float) $v;
+  }  
+}
+
+
+
+if ($verbose)
+{
+  echo "Ok\n";
+}
+
+
+/**********************************************************/
+// Create a new empty RRD file to store the merge
+if ($verbose)
+{
+  echo "Create a new empty RRD file to store the merge... ";
+}
+
+$_options = array(
+  '--start', ($data_xport['start']-1),
+  '--step', $data_xport['step'],
+  '-b '.($data_xport['start']-1),
+  'DS:input:GAUGE:'.($data_xport['step']*2).':0:U',
+  'DS:output:GAUGE:'.($data_xport['step']*2).':0:U',
+  'RRA:AVERAGE:0.5:1:'.count($new_data_merge)
+);
+
+if (!is_writable($opts['output_path']))
+{
+  throw new ErrorException('This directory '.$opts['output_path'].' is not writeable.');
+}
+
+if (!rrd_create($opts['output'], $_options))
+{
+  throw new ErrorException('Unable to create a new RRD file. '.rrd_error());
+}
+
+if ($verbose)
+{
+  echo "Ok\n";
+}
+
+
+/**********************************************************/
+// Inserting data into the new RRD
+if ($verbose)
+{
+  echo "Inserting data into the new RRD...";
+}
+
+foreach ($new_data_merge as $k=>$v)
+{
+  if ($verbose)
+  {
+    echo ".";
+  }
+  
+  // Debug
+  //echo $k.':'.round($v['input']).':'.round($v['output'])."\n";
+
+  if (!rrd_update($opts['output'], array($k.':'.round($v['input']).':'.round($v['output']))))
+  {
+    throw new Exception('RRDTool update error on timestamp '.$k.' : '.rrd_error());
+  }
+
+}
+
+
+$_time_stop = microtime(true);
+
+if ($verbose)
+{
+  echo "Ok\n";
+  echo "\n";
+  echo "End of merge.\n";
+  echo "\n";
+  echo "Report : ".round((memory_get_peak_usage()/1024/1024), 2)."M memory used | ".number_format($_time_stop-$_time_start, 3)."sec\n\n";
+}
+exit(1);
+?>
